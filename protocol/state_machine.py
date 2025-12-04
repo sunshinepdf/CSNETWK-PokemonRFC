@@ -117,12 +117,11 @@ class ProtocolStateMachine:
         msg = decode_message(data)
         message_type = msg.get("message_type")
 
-        # Always send ACK if needed
-        self.r.incoming_message(msg, addr, self.transport)
-
-        # Save peer address if not set yet
+        # Save peer address BEFORE processing reliability
         if self.peer_addr is None and self.role != "SPECTATOR":
             self.peer_addr = addr
+
+        self.r.incoming_message(msg, addr, self.transport)
 
         # Dispatch by message type
         if message_type == "HANDSHAKE_REQUEST":
@@ -171,6 +170,23 @@ class ProtocolStateMachine:
     # ** HANDSHAKE **
     # ============================================================
 
+    def send_handshake_request(self):
+        """
+        JOINER uses this to initiate the handshake AFTER discovering a host.
+        """
+        if self.role != "JOINER":
+            print("[SM] Ignoring handshake request: not JOINER")
+            return
+
+        if not self.peer_addr:
+            print("[SM] Cannot send HANDSHAKE_REQUEST — no peer_addr yet")
+            return
+
+        print(f"[SM] Sending HANDSHAKE_REQUEST to {self.peer_addr}")
+        self._send_reliable({
+            "message_type": "HANDSHAKE_REQUEST"
+        })
+    
     def _on_handshake_request(self, msg, addr):
         """
         Only HOST receives this.
