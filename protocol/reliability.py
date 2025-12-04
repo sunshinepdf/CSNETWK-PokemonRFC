@@ -21,7 +21,10 @@ It only ensures messages eventually arrive or the connection fails.
 import time
 from typing import Dict, Tuple, Optional, Any
 
-from .messages import encode_message
+try:
+    from .message import encode_message
+except ImportError:
+    from protocol.message import encode_message
 
 
 class ReliabilityError(Exception):
