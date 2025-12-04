@@ -25,6 +25,7 @@ from protocol.state_machine import ProtocolStateMachine
 from protocol.broadcast import BroadcastDiscovery
 from protocol import game_logic
 
+BROADCAST_PORT = 5556
 
 class BattleApplication:
     """Main application controller."""
@@ -71,22 +72,17 @@ class BattleApplication:
 
         # Initialize broadcast for discovery (use separate port to avoid collisions)
         try:
-            self.broadcast = BroadcastDiscovery(port=5556)
+            self.broadcast = BroadcastDiscovery(port=BROADCAST_PORT)
             self.broadcast.open()
         except Exception as e:
-            print(f"[App] Warning: broadcast discovery failed to open: {e}")
+            print(f"[APP] Warning: broadcast discovery failed to open: {e}")
             self.broadcast = None
 
         # If joining, send handshake request
         if role == "JOINER" and host_ip and host_port:
-            print(f"[App] Sending HANDSHAKE_REQUEST to {host_ip}:{host_port}")
+            print(f"[APP] Sending HANDSHAKE_REQUEST to {host_ip}:{host_port}")
             self.state_machine.peer_addr = (host_ip, host_port)
-            # Best-effort send; reliability layer will handle retries
-            ok, _ = self.reliability.send_reliable(
-                self.transport,
-                {"message_type": "HANDSHAKE_REQUEST"},
-                (host_ip, host_port)
-            )
+            self.state_machine.send_handshake_request()
             if not ok:
                 print("[App] Warning: initial HANDSHAKE_REQUEST may not have been sent")
 
@@ -374,7 +370,7 @@ def discover_games():
     """Discover available games on the network."""
     print("[Discovery] Searching for games on local network...")
 
-    broadcast = BroadcastDiscovery(port=5556)
+    broadcast = BroadcastDiscovery(port=BROADCAST_PORT)
     try:
         broadcast.open()
     except Exception as e:
