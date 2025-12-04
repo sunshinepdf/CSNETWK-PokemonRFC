@@ -15,7 +15,8 @@ class UDPTransport:
         
         self.socket.bind((self.host, self.port))
         
-        self.socket.settimeout(0.1)
+        # Reduce receive timeout to minimize handshake latency
+        self.socket.settimeout(0.01)
         
         self.running = True
         print(f"[UDP] Socket bound to {self.host}:{self.port}")
