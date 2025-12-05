@@ -12,27 +12,45 @@ from dataclasses import dataclass
 
 @dataclass
 class PokemonStats:
-    """Represents a Pokémon's battle statistics and type effectiveness."""
-    name: str
-    hp: int
-    attack: float
-    defense: float
-    sp_attack: float
-    sp_defense: float
-    speed: float
-    type1: str
-    type2: Optional[str]
-    effectiveness: Dict[str, float]
-    pokedex_number: int
-    generation: int
-    is_legendary: bool
-    
+    """Represents a Pokémon's battle statistics, abilities, and type effectiveness."""
+    def __init__(self,
+                 name: str,
+                 hp: int,
+                 attack: float,
+                 defense: float,
+                 sp_attack: float,
+                 sp_defense: float,
+                 speed: float,
+                 type1: str,
+                 type2: Optional[str],
+                 effectiveness: Dict[str, float],
+                 pokedex_number: int,
+                 generation: int,
+                 is_legendary: bool,
+                 abilities: List[str]):
+        self.name = name
+        self.hp = hp
+        self.attack = attack
+        self.defense = defense
+        self.sp_attack = sp_attack
+        self.sp_defense = sp_defense
+        self.speed = speed
+        self.type1 = type1
+        self.type2 = type2
+        self.effectiveness = effectiveness
+        self.pokedex_number = pokedex_number
+        self.generation = generation
+        self.is_legendary = is_legendary
+        self.abilities = abilities
+
     def get_types_list(self) -> List[str]:
-        """Return list of types, filtering out None values."""
         types = [self.type1]
         if self.type2 and self.type2.lower() not in ['', 'none', 'null']:
             types.append(self.type2)
         return types
+
+    def __repr__(self):
+        return f"<PokemonStats {self.name} ({self.type1}{'/' + self.type2 if self.type2 else ''}) abilities={self.abilities}>"
 
 
 class PokemonDatabase:
@@ -75,21 +93,29 @@ class PokemonDatabase:
                                 effectiveness[type_name] = float(value)
                             except (ValueError, TypeError):
                                 effectiveness[type_name] = 1.0
-                    
+
+                    # Parse abilities
+                    abilities_raw = row.get('abilities', '')
+                    abilities = []
+                    if abilities_raw:
+                        # Remove brackets and split by comma
+                        abilities_raw = abilities_raw.strip().replace('[', '').replace(']', '')
+                        abilities = [a.strip().strip("'") for a in abilities_raw.split(',') if a.strip()]
+
                     # Parse stats
                     hp_value = int(float(row['hp']))
-                    
+
                     # Parse type2 (optional)
                     type2 = row.get('type2', '').strip()
                     if type2.lower() in ['', 'nan', 'none', 'null']:
                         type2 = None
-                    
+
                     # Parse generation
                     try:
                         generation = int(row.get('generation', 1))
                     except (ValueError, TypeError):
                         generation = 1
-                    
+
                     # Parse legendary status
                     is_legendary = False
                     legendary_val = row.get('is_legendary', '0')
@@ -98,7 +124,7 @@ class PokemonDatabase:
                             is_legendary = bool(int(float(legendary_val)))
                         except (ValueError, TypeError):
                             is_legendary = False
-                    
+
                     pokemon = PokemonStats(
                         name=row['name'].strip(),
                         hp=hp_value,
@@ -112,13 +138,14 @@ class PokemonDatabase:
                         effectiveness=effectiveness,
                         pokedex_number=int(row['pokedex_number']),
                         generation=generation,
-                        is_legendary=is_legendary
+                        is_legendary=is_legendary,
+                        abilities=abilities
                     )
-                    
+
                     # Store with lowercase name for case-insensitive lookup
                     self.data[pokemon.name.lower()] = pokemon
                     loaded_count += 1
-                    
+
                 except (ValueError, KeyError) as e:
                     if self.verbose:
                         print(f"[PokemonDatabase] Skipping row {row_num}: {e}")

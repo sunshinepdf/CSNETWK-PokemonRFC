@@ -31,13 +31,18 @@ class ProtocolStateMachine:
     # ----------------------------
     # Constructor
     # ----------------------------
-    def __init__(self, transport, reliability: ReliabilityLayer, role: str):
+    def __init__(self, transport, reliability: ReliabilityLayer, role: str, local_name: str = "Player"):
         """
         role: "HOST", "JOINER", or "SPECTATOR"
         """
         self.transport = transport
         self.r = reliability
         self.role = role
+        self.local_name: str = local_name
+        self.remote_name: Optional[str] = None
+        # Spectator naming and last-incoming tracking
+        self.spectator_names: Dict[Tuple[str, int], str] = {}
+        self.last_incoming_addr: Optional[Tuple[str, int]] = None
 
         # Remote peer address (filled after handshake)
         self.peer_addr: Optional[Tuple[str, int]] = None
@@ -71,10 +76,43 @@ class ProtocolStateMachine:
     # ----------------------------
     def _send_reliable(self, fields: Dict[str, Any]):
         if not self.peer_addr:
-            print("[SM] No peer address set — cannot send")
-            return False
-        ok, _seq = self.r.send_reliable(self.transport, fields, self.peer_addr)
-        return ok
+            return False, None
+        ok, seq = self.r.send_reliable(self.transport, fields, self.peer_addr)
+        # If we're HOST, also relay to all spectators so they receive events
+        if self.role == "HOST" and self.spectators:
+            for spec_addr in list(self.spectators):
+                try:
+                    self.r.send_reliable(self.transport, dict(fields), spec_addr)
+                except Exception:
+                    pass
+        return ok, seq
+    
+    def _print_message(self, fields: Dict[str, Any], seq: Optional[int] = None):
+        """Print an outgoing message in RFC wire format with sequence_number if available."""
+        print(f"\n[{self.local_name}]")
+        for key, value in fields.items():
+            # Avoid double-printing sequence_number and avoid dumping full Pokémon stats
+            if key == "sequence_number":
+                continue
+            if key == "pokemon":
+                print("pokemon: [sent]")
+                continue
+            print(f"{key}: {value}")
+        if seq is not None:
+            print(f"sequence_number: {seq}")
+
+    def _print_incoming_header(self):
+        label = self.remote_name or "REMOTE"
+        addr = self.last_incoming_addr
+        if self.role == "HOST" and addr is not None:
+            if self.peer_addr and addr == self.peer_addr:
+                label = self.remote_name or f"REMOTE {addr[0]}:{addr[1]}"
+            else:
+                spec = self.spectator_names.get(addr)
+                if not spec:
+                    spec = f"{addr[0]}:{addr[1]}"
+                label = f"SPECTATOR {spec}"
+        print(f"\n[{label}]")
 
     # ----------------------------
     # Tick called every loop
@@ -89,6 +127,10 @@ class ProtocolStateMachine:
         except ReliabilityError:
             print("[StateMachine] Peer unresponsive. Ending battle.")
             self.running = False
+            return
+
+        # Spectators never calculate or send reports
+        if self.role == "SPECTATOR":
             return
 
         # If both sides should be processing the turn and we haven't sent our local
@@ -107,7 +149,7 @@ class ProtocolStateMachine:
                 try:
                     self.send_calculation_report(move)
                 except Exception as e:
-                    print(f"[SM] Error sending calculation report: {e}")
+                    print(f"[StateMachine] Error sending calculation report: {e}")
 
     # ----------------------------
     # Incoming dispatcher
@@ -116,12 +158,28 @@ class ProtocolStateMachine:
         data, addr = incoming
         msg = decode_message(data)
         message_type = msg.get("message_type")
+        # Track incoming address for header context
+        self.last_incoming_addr = addr
 
         # Save peer address BEFORE processing reliability
         if self.peer_addr is None and self.role != "SPECTATOR":
             self.peer_addr = addr
 
         self.r.incoming_message(msg, addr, self.transport)
+
+        # If HOST receives a battle/control event from JOINER, relay it to spectators
+        if self.role == "HOST" and self.peer_addr and addr == self.peer_addr:
+            # Relay everything except ACKs to spectators so they see the same stream
+            if message_type and message_type != "ACK":
+                forward_fields = dict(msg)
+                # strip reliability-only fields when forwarding
+                forward_fields.pop("sequence_number", None)
+                forward_fields.pop("ack_number", None)
+                for spec_addr in list(self.spectators):
+                    try:
+                        self.r.send_reliable(self.transport, dict(forward_fields), spec_addr)
+                    except Exception:
+                        pass
 
         # Dispatch by message type
         if message_type == "HANDSHAKE_REQUEST":
@@ -156,6 +214,27 @@ class ProtocolStateMachine:
 
         elif message_type == "CHAT_MESSAGE":
             self._on_chat(msg)
+            # Relay chat across roles:
+            # - If HOST receives from spectator (addr != peer_addr), forward to JOINER
+            # - If HOST receives from JOINER (addr == peer_addr), forward to spectators
+            if self.role == "HOST":
+                forward_fields = dict(msg)
+                # Remove reliability-only fields when forwarding
+                forward_fields.pop("sequence_number", None)
+                forward_fields.pop("ack_number", None)
+                if self.peer_addr and addr != self.peer_addr:
+                    # from spectator -> forward to joiner
+                    try:
+                        self.r.send_reliable(self.transport, forward_fields, self.peer_addr)
+                    except Exception:
+                        pass
+                else:
+                    # from joiner -> forward to all spectators
+                    for spec_addr in list(self.spectators):
+                        try:
+                            self.r.send_reliable(self.transport, dict(forward_fields), spec_addr)
+                        except Exception:
+                            pass
 
         elif message_type == "ACK":
             # Handle ACK for reliability layer
@@ -175,17 +254,14 @@ class ProtocolStateMachine:
         JOINER uses this to initiate the handshake AFTER discovering a host.
         """
         if self.role != "JOINER":
-            print("[SM] Ignoring handshake request: not JOINER")
             return
 
         if not self.peer_addr:
-            print("[SM] Cannot send HANDSHAKE_REQUEST — no peer_addr yet")
             return
 
-        print(f"[SM] Sending HANDSHAKE_REQUEST to {self.peer_addr}")
-        self._send_reliable({
-            "message_type": "HANDSHAKE_REQUEST"
-        })
+        fields = {"message_type": "HANDSHAKE_REQUEST"}
+        ok, seq = self._send_reliable(fields)
+        self._print_message(fields, seq)
     
     def _on_handshake_request(self, msg, addr):
         """
@@ -193,20 +269,29 @@ class ProtocolStateMachine:
         """
         if self.role != "HOST":
             return
-        print("[SM] Received HANDSHAKE_REQUEST")
 
         import random
         seed = random.randint(1, 999999)
 
+        # HOST must also seed its RNG with the same seed
+        from . import game_logic
+        game_logic.set_seed(seed)
+
         self.peer_addr = addr
-        self._send_reliable({
+        fields = {
             "message_type": "HANDSHAKE_RESPONSE",
             "seed": seed
-        })
+        }
+        ok, seq = self._send_reliable(fields)
+        self._print_message(fields, seq)
         
         # Transition to waiting for battle setup
         self.state = "WAITING_FOR_SETUP"
-        print("[SM] Handshake complete (HOST), waiting for battle setup...")
+        print(f"\n[{self.local_name}]")
+        print("message_type: HANDSHAKE_COMPLETE")
+        print("role: HOST")
+        print("state: WAITING_FOR_SETUP")
+        print(f"seed: {seed}")
 
     def _on_handshake_response(self, msg):
         """
@@ -215,7 +300,8 @@ class ProtocolStateMachine:
         if self.role != "JOINER":
             return
 
-        print("[SM] Received HANDSHAKE_RESPONSE")
+        self._print_incoming_header()
+        print("message_type: HANDSHAKE_RESPONSE")
 
         ok, missing = require_fields(msg, ["seed"])
         if not ok:
@@ -230,13 +316,26 @@ class ProtocolStateMachine:
 
         # Transition to waiting for setup exchange
         self.state = "WAITING_FOR_SETUP"
-        print("[SM] Handshake complete (JOINER), ready to exchange battle setup...")
+        print(f"\n[{self.local_name}]")
+        print("message_type: HANDSHAKE_COMPLETE")
+        print("role: JOINER")
+        print("state: WAITING_FOR_SETUP")
+        print(f"seed: {seed}")
 
     def _on_spectator_request(self, msg, addr):
         """
         Spectators just join and receive all battle/chat events.
         """
-        print("[SM] Spectator joined:", addr)
+        # Record spectator address and optional name
+        if addr not in self.spectators:
+            self.spectators.append(addr)
+        provided = msg.get("sender_name") or msg.get("trainer_name")
+        if isinstance(provided, str) and provided:
+            self.spectator_names[addr] = provided
+        self.last_incoming_addr = addr
+        self._print_incoming_header()
+        print("message_type: SPECTATOR_JOINED")
+        print(f"address: {addr}")
 
     # ============================================================
     # ** BATTLE SETUP **
@@ -248,16 +347,33 @@ class ProtocolStateMachine:
         """
         self.local_pokemon = pokemon
 
-        self._send_reliable({
+        fields = {
             "message_type": "BATTLE_SETUP",
             "communication_mode": "P2P",
             "pokemon_name": pokemon.name,
             "pokemon": pokemon.to_json(),
             "stat_boosts": str(stat_boosts),
-        })
+            "trainer_name": self.local_name,
+        }
+        ok, seq = self._send_reliable(fields)
+        self._print_message(fields, seq)
+        
+        # Check if we can transition now (if we already received opponent's setup)
+        if self.local_pokemon and self.remote_pokemon:
+            self.state = "WAITING_FOR_MOVE"
+            
+            if self.role == "HOST":
+                self.turn_owner = "LOCAL"
+            else:
+                self.turn_owner = "REMOTE"
 
     def _on_battle_setup(self, msg):
-        print("[SM] Received BATTLE_SETUP")
+        # Cache remote trainer name if provided
+        rn = msg.get("trainer_name")
+        if rn and rn != self.local_name:
+            self.remote_name = rn
+        self._print_incoming_header()
+        print("message_type: BATTLE_SETUP")
 
         ok, missing = require_fields(
             msg,
@@ -278,13 +394,22 @@ class ProtocolStateMachine:
 
         # If both Pokémon are ready, begin battle
         if self.local_pokemon and self.remote_pokemon:
-            print("[SM] Both battle setups done.")
+            print(f"\n[{self.local_name}]")
+            print("message_type: BATTLE_START")
+            print(f"local_pokemon: {self.local_pokemon.name}")
+            print(f"remote_pokemon: {self.remote_pokemon.name}")
             self.state = "WAITING_FOR_MOVE"
 
             if self.role == "HOST":
                 self.turn_owner = "LOCAL"
+                print(f"\n[{self.local_name}]")
+                print("message_type: TURN_ANNOUNCE")
+                print("turn_owner: LOCAL")
             else:
                 self.turn_owner = "REMOTE"
+                print(f"\n[{self.local_name}]")
+                print("message_type: TURN_ANNOUNCE")
+                print("turn_owner: REMOTE")
 
     # ============================================================
     # ** TURN 1: ATTACK ANNOUNCE **
@@ -295,43 +420,47 @@ class ProtocolStateMachine:
         Called only when it is OUR turn.
         """
         if self.turn_owner != "LOCAL":
-            print("[SM] Not our turn to attack")
             return
         if self.state != "WAITING_FOR_MOVE":
-            print("[SM] Cannot attack in current state:", self.state)
             return
 
         # Save last announced move so attacker can use it later
         self.last_announced_move = move_name
 
-        print("[SM] Sending ATTACK_ANNOUNCE:", move_name)
-
-        self._send_reliable({
+        fields = {
             "message_type": "ATTACK_ANNOUNCE",
             "move_name": move_name
-        })
+        }
+        ok, seq = self._send_reliable(fields)
+        self._print_message(fields, seq)
 
         self.state = "WAITING_FOR_DEFENSE"
 
     def _on_attack_announce(self, msg):
-        print("[SM] Received ATTACK_ANNOUNCE")
+        self._print_incoming_header()
+        print("message_type: ATTACK_ANNOUNCE")
+        if "move_name" in msg:
+            print(f"move_name: {msg['move_name']}")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
         if self.turn_owner != "REMOTE":
-            # If turn_owner unknown or different, still accept but log
-            print("[SM] Warning: received ATTACK_ANNOUNCE but turn_owner is", self.turn_owner)
-            # continue — allow defender to proceed
+            pass
 
         ok, missing = require_fields(msg, ["move_name"])
         if not ok:
-            print("[SM] Missing:", missing)
             return
 
         self.remote_move = msg["move_name"]
 
-        # Immediately send defense announce
-        self._send_reliable({
-            "message_type": "DEFENSE_ANNOUNCE"
-        })
+        # Spectators should not participate (no defense announce, no state change)
+        if self.role == "SPECTATOR":
+            return
+
+        # Immediately send defense announce and relay to spectators
+        fields = {"message_type": "DEFENSE_ANNOUNCE"}
+        ok, seq = self._send_reliable(fields)
+        self._print_message(fields, seq)
 
         # Enter processing turn and trigger sending of calculation report on next tick
         self.state = "PROCESSING_TURN"
@@ -341,18 +470,24 @@ class ProtocolStateMachine:
         try:
             self.send_calculation_report(self.remote_move)
         except Exception as e:
-            print(f"[SM] Error during defender calculation: {e}")
+            pass
 
     # ============================================================
     # ** TURN 2: DEFENSE ANNOUNCE **
     # ============================================================
 
     def _on_defense_announce(self, msg):
-        print("[SM] Received DEFENSE_ANNOUNCE")
+        self._print_incoming_header()
+        print("message_type: DEFENSE_ANNOUNCE")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
         if self.turn_owner != "LOCAL":
-            # Attackers expect DEFENSE_ANNOUNCE when they had the turn; warn if not
-            print("[SM] Warning: DEFENSE_ANNOUNCE received but turn_owner is", self.turn_owner)
+            pass
+
+        # Spectators should not enter processing or calculate
+        if self.role == "SPECTATOR":
+            return
 
         self.state = "PROCESSING_TURN"
 
@@ -361,7 +496,7 @@ class ProtocolStateMachine:
             try:
                 self.send_calculation_report(self.last_announced_move)
             except Exception as e:
-                print(f"[SM] Error sending attacker calculation: {e}")
+                pass
 
     # ============================================================
     # ** TURN 3: DAMAGE CALCULATION / REPORT **
@@ -377,6 +512,12 @@ class ProtocolStateMachine:
         if not self.local_pokemon or not self.remote_pokemon:
             raise RuntimeError("Both local and remote Pokémon must be set before calculating damage")
 
+        # Look up the move object from game_logic
+        from . import game_logic
+        move = game_logic.get_move(move_name)
+        if not move:
+            raise RuntimeError(f"Move '{move_name}' not found in move database")
+
         # Determine if local is the attacker or defender.
         # If turn_owner == "LOCAL" then the local peer issued the ATTACK_ANNOUNCE.
         local_is_attacker = (self.turn_owner == "LOCAL")
@@ -386,7 +527,7 @@ class ProtocolStateMachine:
             defender = self.remote_pokemon
             attacker_name = attacker.name
             # compute damage dealt to remote
-            dmg = calculate_damage(attacker, defender, move_name)
+            dmg = calculate_damage(attacker, defender, move)
             defender.hp -= dmg
             attacker_remaining = attacker.hp
             defender_remaining = max(defender.hp, 0)
@@ -395,11 +536,24 @@ class ProtocolStateMachine:
             attacker = self.remote_pokemon
             defender = self.local_pokemon
             attacker_name = attacker.name
-            dmg = calculate_damage(attacker, defender, move_name)
+            dmg = calculate_damage(attacker, defender, move)
             defender.hp -= dmg
             # note: attacker_remaining is remote's HP (unchanged by this local calculation)
             attacker_remaining = attacker.hp
             defender_remaining = max(defender.hp, 0)
+
+        # Build status message with effectiveness wording
+        effectiveness_msg = ""
+        try:
+            eff = game_logic.get_type_effectiveness(move.type, defender)
+            if eff == 0:
+                effectiveness_msg = " It had no effect."
+            elif eff >= 1.5:
+                effectiveness_msg = " It was super effective!"
+            elif eff < 1.0:
+                effectiveness_msg = " It was not very effective."
+        except Exception:
+            pass
 
         report = {
             "message_type": "CALCULATION_REPORT",
@@ -408,34 +562,48 @@ class ProtocolStateMachine:
             "remaining_health": int(attacker_remaining),
             "damage_dealt": int(dmg),
             "defender_hp_remaining": int(defender_remaining),
-            "status_message": f"{attacker_name} used {move_name}!",
+            "status_message": f"{attacker_name} used {move_name}!{effectiveness_msg}",
         }
 
         self.local_calc_report = report
 
         # Send the report reliably
-        self._send_reliable(report)
+        ok, seq = self._send_reliable(report)
+        
+        # Print outgoing message in RFC format with sequence_number
+        self._print_message(report, seq)
 
         # If this damage caused a faint locally, send GAME_OVER to peer
         if defender.hp <= 0:
             loser = defender.name
             winner = attacker.name
-            print(f"[SM] Detected faint: {loser} — sending GAME_OVER")
-            self._send_reliable({
+            fields = {
                 "message_type": "GAME_OVER",
                 "winner": winner,
                 "loser": loser
-            })
+            }
+            ok, seq = self._send_reliable(fields)
+            self._print_message(fields, seq)
 
     def _on_calculation_report(self, msg):
-        print("[SM] Received CALCULATION_REPORT")
+        self._print_incoming_header()
+        print("message_type: CALCULATION_REPORT")
+        if "attacker" in msg:
+            print(f"attacker: {msg['attacker']}")
+        if "move_used" in msg:
+            print(f"move_used: {msg['move_used']}")
+        if "damage_dealt" in msg:
+            print(f"damage_dealt: {msg['damage_dealt']}")
+        if "defender_hp_remaining" in msg:
+            print(f"defender_hp_remaining: {msg['defender_hp_remaining']}")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
         ok, missing = require_fields(
             msg, 
             ["attacker", "move_used", "damage_dealt", "defender_hp_remaining"]
         )
         if not ok:
-            print("[SM] Missing:", missing)
             return
 
         self.last_calc_report_remote = msg
@@ -454,29 +622,34 @@ class ProtocolStateMachine:
             local_def_hp = int(local["defender_hp_remaining"])
             remote_def_hp = int(remote["defender_hp_remaining"])
         except Exception:
-            print("[SM] Invalid numbers in calculation reports")
             return
 
         if (local_dmg == remote_dmg and local_def_hp == remote_def_hp):
             # Synchronized
-            self._send_reliable({"message_type": "CALCULATION_CONFIRM"})
+            fields = {"message_type": "CALCULATION_CONFIRM"}
+            ok, seq = self._send_reliable(fields)
+            self._print_message(fields, seq)
         else:
-            print("[SM] Mismatch detected, requesting resolution")
             # Send our calculated values for resolution
-            self._send_reliable({
+            fields = {
                 "message_type": "RESOLUTION_REQUEST",
                 "attacker": local.get("attacker"),
                 "move_used": local.get("move_used"),
                 "damage_dealt": str(local.get("damage_dealt")),
                 "defender_hp_remaining": str(local.get("defender_hp_remaining"))
-            })
+            }
+            ok, seq = self._send_reliable(fields)
+            self._print_message(fields, seq)
 
     # ============================================================
     # ** TURN 4: CONFIRMATION / RESOLUTION **
     # ============================================================
 
     def _on_calculation_confirm(self, msg):
-        print("[SM] Received CALCULATION_CONFIRM")
+        self._print_incoming_header()
+        print("message_type: CALCULATION_CONFIRM")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
         # Turn ends — reverse turn ownership
         self.turn_owner = "REMOTE" if self.turn_owner == "LOCAL" else "LOCAL"
@@ -486,14 +659,16 @@ class ProtocolStateMachine:
         self.state = "WAITING_FOR_MOVE"
 
     def _on_resolution_request(self, msg):
-        print("[SM] Received RESOLUTION_REQUEST")
+        self._print_incoming_header()
+        print("message_type: RESOLUTION_REQUEST")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
-        # Accept peer’s corrected calculation
+        # Accept peer's corrected calculation
         try:
             dmg = int(msg["damage_dealt"])
             hp = int(msg["defender_hp_remaining"])
-        except Exception as e:
-            print(f"[SM] Invalid resolution request values: {e}")
+        except Exception:
             return
 
         # Update the defender's HP according to the resolution (msg describes defender_hp_remaining)
@@ -523,9 +698,17 @@ class ProtocolStateMachine:
     # ============================================================
 
     def _on_game_over(self, msg):
-        print("[SM] Received GAME_OVER")
-        print("Winner:", msg.get("winner"))
-        print("Loser:", msg.get("loser"))
+        self._print_incoming_header()
+        print("message_type: GAME_OVER")
+        if "winner" in msg:
+            print(f"winner: {msg['winner']}")
+        if "loser" in msg:
+            print(f"loser: {msg['loser']}")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
+        
+        print("\nWinner:", msg.get("winner"))
+        print("\nLoser:", msg.get("loser"))
         self.running = False
 
     # ============================================================
@@ -533,16 +716,33 @@ class ProtocolStateMachine:
     # ============================================================
 
     def _on_chat(self, msg):
-        print(f"[CHAT] {msg.get('sender_name')}: ", end="")
+        # Update name caches from chat
+        sender = msg.get("sender_name")
+        if sender and sender != self.local_name:
+            addr = self.last_incoming_addr
+            if self.role == "HOST" and addr is not None and (self.peer_addr is None or addr != self.peer_addr):
+                self.spectator_names[addr] = sender
+            else:
+                if not self.remote_name:
+                    self.remote_name = sender
+        self._print_incoming_header()
+        print("message_type: CHAT_MESSAGE")
+        if "sender_name" in msg:
+            print(f"sender_name: {msg['sender_name']}")
+        if "content_type" in msg:
+            print(f"content_type: {msg['content_type']}")
         if msg.get("content_type") == "TEXT":
-            print(msg.get("message_text"))
+            if "message_text" in msg:
+                print(f"message_text: {msg.get('message_text')}")
         elif msg.get("content_type") == "STICKER":
             sticker_data = msg.get("sticker_data")
             if sticker_data:
                 filename = chat.save_sticker_to_file(sticker_data)
-                print(f"[Sticker Received and saved to {filename}]")
+                print(f"sticker_data: [Base64 encoded, saved to {filename}]")
             else:
-                print("[Sticker Received] (No data)")
+                print("sticker_data: [No data]")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
     def send_chat_text(self, sender_name: str, text: str):
         """
@@ -553,8 +753,16 @@ class ProtocolStateMachine:
             text: Message text content
         """
         msg_dict = chat.make_text_message(sender_name, text)
-        self._send_reliable(msg_dict)
-        print(f"[CHAT] Sent: {text}")
+        ok, seq = self.r.send_reliable(self.transport, msg_dict, self.peer_addr)
+        
+        # Print outgoing message in RFC format
+        print(f"\n[{self.local_name}]")
+        print("message_type: CHAT_MESSAGE")
+        print(f"sender_name: {sender_name}")
+        print("content_type: TEXT")
+        print(f"message_text: {text}")
+        if seq is not None:
+            print(f"sequence_number: {seq}")
 
     def send_chat_sticker(self, sender_name: str, sticker_bytes: bytes):
         """
@@ -565,5 +773,13 @@ class ProtocolStateMachine:
             sticker_bytes: Raw binary sticker data (e.g., PNG file bytes)
         """
         msg_dict = chat.make_sticker_message(sender_name, sticker_bytes)
-        self._send_reliable(msg_dict)
-        print(f"[CHAT] Sent sticker ({len(sticker_bytes)} bytes)")
+        ok, seq = self.r.send_reliable(self.transport, msg_dict, self.peer_addr)
+        
+        # Print outgoing message in RFC format
+        print(f"\n[{self.local_name}]")
+        print("message_type: CHAT_MESSAGE")
+        print(f"sender_name: {sender_name}")
+        print("content_type: STICKER")
+        print(f"sticker_data: [Base64 encoded, {len(sticker_bytes)} bytes]")
+        if seq is not None:
+            print(f"sequence_number: {seq}")
