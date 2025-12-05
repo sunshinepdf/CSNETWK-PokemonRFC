@@ -14,6 +14,7 @@ Features:
 """
 
 import sys
+import os
 import time
 import threading
 from typing import Optional
@@ -25,7 +26,8 @@ from protocol.state_machine import ProtocolStateMachine
 from protocol.broadcast import BroadcastDiscovery
 from protocol import game_logic
 
-BROADCAST_PORT = 5556
+# Allow overriding the broadcast port via environment variable
+BROADCAST_PORT = int(os.getenv("POKEMON_BROADCAST_PORT", "5556"))
 
 class BattleApplication:
     """Main application controller."""
@@ -54,7 +56,7 @@ class BattleApplication:
         """
         # Load game data
         print("[App] Loading Pokémon and moves from CSV...")
-        game_logic.initialize_databases(pokemon_csv="pokemon.csv", moves_csv="moves.csv", verbose=True)
+        game_logic.initialize_databases(pokemon_csv="pokemon.csv", verbose=True)
 
         # Initialize transport
         self.transport = UDPTransport(port, "0.0.0.0")
@@ -67,22 +69,30 @@ class BattleApplication:
         self.state_machine = ProtocolStateMachine(
             self.transport,
             self.reliability,
-            role
+            role,
+            self.player_name
         )
 
         # Initialize broadcast for discovery (use separate port to avoid collisions)
+        # HOST uses send-only mode, JOINER uses listen mode (via discover_games())
         try:
             self.broadcast = BroadcastDiscovery(port=BROADCAST_PORT)
-            self.broadcast.open()
+            # For HOST, this won't bind to avoid receiving own announcements
+            # For JOINER, this is only used for sending invitations if needed
+            self.broadcast.open(listen_only=False)
         except Exception as e:
-            print(f"[APP] Warning: broadcast discovery failed to open: {e}")
+            print(f"[App] Warning: broadcast discovery failed to open: {e}")
             self.broadcast = None
 
         # If joining, send handshake request
         if role == "JOINER" and host_ip and host_port:
-            print(f"[APP] Sending HANDSHAKE_REQUEST to {host_ip}:{host_port}")
+            print(f"[App] Sending HANDSHAKE_REQUEST to {host_ip}:{host_port}")
             self.state_machine.peer_addr = (host_ip, host_port)
-            self.state_machine.send_handshake_request()
+            ok, _ = self.reliability.send_reliable(
+                self.transport,
+                {"message_type": "HANDSHAKE_REQUEST"},
+                (host_ip, host_port)
+            )
             if not ok:
                 print("[App] Warning: initial HANDSHAKE_REQUEST may not have been sent")
 
@@ -146,13 +156,19 @@ class BattleApplication:
         print("\n" + "="*60)
         print("POKEPROTOCOL BATTLE - COMMANDS:")
         print("="*60)
-        print("  setup <pokemon> <sp_atk> <sp_def>  - Setup your Pokémon")
-        print("  attack <move>                      - Use a move (your turn)")
-        print("  chat <message>                     - Send chat message")
-        print("  sticker <filepath>                 - Send sticker image")
-        print("  list                               - List available Pokémon/moves")
-        print("  status                             - Show battle status")
-        print("  quit                               - Exit application")
+        if self.state_machine and self.state_machine.role == "SPECTATOR":
+            print("  chat <message>                     - Send chat message")
+            print("  list                               - List your Pokémon abilities")
+            print("  status                             - Show battle status")
+            print("  quit                               - Exit application")
+        else:
+            print("  setup <pokemon> <sp_atk> <sp_def>  - Setup your Pokémon")
+            print("  attack <move>                      - Use a move (your turn)")
+            print("  chat <message>                     - Send chat message")
+            print("  sticker <filepath>                 - Send sticker image")
+            print("  list                               - List your Pokémon abilities")
+            print("  status                             - Show battle status")
+            print("  quit                               - Exit application")
         print("="*60 + "\n")
 
         # Defensive: ensure state_machine exists
@@ -175,15 +191,24 @@ class BattleApplication:
                     break
 
                 elif action == "setup" and len(parts) > 1:
+                    if self.state_machine and self.state_machine.role == "SPECTATOR":
+                        print("[App] Spectators cannot setup Pokémon. Only chat is allowed.")
+                        continue
                     self._handle_setup(parts[1])
 
                 elif action == "attack" and len(parts) > 1:
+                    if self.state_machine and self.state_machine.role == "SPECTATOR":
+                        print("[App] Spectators cannot attack. Only chat is allowed.")
+                        continue
                     self._handle_attack(parts[1])
 
                 elif action == "chat" and len(parts) > 1:
                     self._handle_chat(parts[1])
 
                 elif action == "sticker" and len(parts) > 1:
+                    if self.state_machine and self.state_machine.role == "SPECTATOR":
+                        print("[App] Spectators cannot send stickers. Only chat is allowed.")
+                        continue
                     self._handle_sticker(parts[1])
 
                 elif action == "list":
@@ -235,7 +260,9 @@ class BattleApplication:
             return
 
         self.state_machine.send_battle_setup(pokemon, stat_boosts)
-        print(f"[App] Setup complete: {pokemon.name} (HP: {pokemon.hp})")
+        print("\nmessage_type: BATTLE_SETUP_SENT")
+        print(f"pokemon_name: {pokemon.name}")
+        print(f"hp: {pokemon.hp}")
 
     def _handle_attack(self, move_name: str):
         """Handle attack command."""
@@ -276,21 +303,26 @@ class BattleApplication:
             print(f"Error loading sticker: {e}")
 
     def _handle_list(self):
-        """List available Pokémon and moves."""
+        """List the user's Pokémon's abilities (moves)."""
         print("\n" + "="*60)
-        print("AVAILABLE POKÉMON:")
+        print("YOUR POKÉMON'S ABILITIES (MOVES):")
         print("="*60)
-        for name, data in game_logic.POKEMON_DB.items():
-            types = "/".join(data['types'])
-            print(f"  {name:12} - HP:{data['hp']:3} ATK:{data['attack']:3} "
-                  f"SPATK:{data['special_attack']:3} DEF:{data['defense']:3} "
-                  f"SPDEF:{data['special_defense']:3} [{types}]")
-
-        print("\n" + "="*60)
-        print("AVAILABLE MOVES:")
-        print("="*60)
-        for name, move in game_logic.MOVES_DB.items():
-            print(f"  {name:15} - Power:{move.power:3} [{move.type:8}] ({move.damage_category})")
+        if self.state_machine and self.state_machine.local_pokemon:
+            p = self.state_machine.local_pokemon
+            abilities = p.abilities or []
+            if abilities:
+                for ability in abilities:
+                    move = game_logic.MOVES_DB.get(ability)
+                    if move:
+                        effective_power = game_logic.get_effective_move_power(move, p)
+                        scaled_tag = " (scaled)" if getattr(move, 'scale_with_hp', False) else ""
+                        print(f"  {ability:15} - Power:{int(effective_power):3}{scaled_tag} [{move.type:8}] ({move.damage_category})")
+                    else:
+                        print(f"  {ability:15} - (No move data)")
+            else:
+                print("  None")
+        else:
+            print("  No Pokémon selected. Use 'setup' to choose your Pokémon.")
         print("="*60 + "\n")
 
     def _handle_status(self):
@@ -368,13 +400,14 @@ class BattleApplication:
 
 def discover_games():
     """Discover available games on the network."""
-    print("[Discovery] Searching for games on local network...")
+    print("message_type: BROADCAST_SEARCH\ntimeout: 3.0")
 
     broadcast = BroadcastDiscovery(port=BROADCAST_PORT)
     try:
-        broadcast.open()
+        # JOINER: open in listen-only mode to receive broadcasts
+        broadcast.open(listen_only=True)
     except Exception as e:
-        print(f"[Discovery] Warning: broadcast discovery failed: {e}")
+        print(f"message_type: BROADCAST_ERROR\nerror: discovery failed: {e}")
         return None
 
     games = broadcast.listen_for_games(timeout=3.0)
@@ -382,12 +415,15 @@ def discover_games():
     broadcast.close()
 
     if not games:
-        print("[Discovery] No games found.")
+        print("message_type: NO_GAMES_FOUND")
         return None
 
-    print(f"\n[Discovery] Found {len(games)} game(s):")
+    print(f"\nmessage_type: GAMES_DISCOVERED")
+    print(f"count: {len(games)}")
     for i, (host_name, ip, port) in enumerate(games, 1):
-        print(f"  {i}. {host_name} @ {ip}:{port}")
+        print(f"game_{i}_host: {host_name}")
+        print(f"game_{i}_ip: {ip}")
+        print(f"game_{i}_port: {port}")
 
     try:
         choice_raw = input("Enter game number to join (0 to cancel): ").strip()
@@ -409,9 +445,9 @@ def main():
     print("="*60)
     print("\nSelect mode:")
     print("  1. Host a game")
-    print("  2. Join a game (discover)")
-    print("  3. Join a game (manual IP)")
-    print("  4. Spectate a game")
+    print("  2. Join a game (Broadcast)")
+    print("  3. Join a game (P2P)")
+    print("  4. Spectate a game (Broadcast)")
     print("  0. Exit")
 
     try:
@@ -467,23 +503,26 @@ def main():
             print("Invalid input.")
             return
 
+        # Normalize invalid/unspecified remote IP
+        if host_ip in ("0.0.0.0", "::", ""):  # 0.0.0.0 is not a valid remote target
+            print("[Join] '0.0.0.0' is not a valid remote target. Using 127.0.0.1.")
+            host_ip = "127.0.0.1"
+
         print(f"\n[Join] Connecting to {host_ip}:{host_port}...")
         app.setup("JOINER", local_port, host_ip, host_port)
         app.run()
 
     elif choice == "4":
-        # Spectator mode
-        try:
-            host_ip = input("Enter game IP address: ").strip()
-            host_port = int(input("Enter game port: ").strip())
-            local_port = int(input("Enter your local port (default 5558): ") or "5558")
-        except (ValueError, EOFError, KeyboardInterrupt):
-            print("Invalid input.")
-            return
-
-        print(f"\n[Spectate] Connecting to {host_ip}:{host_port}...")
-        app.setup("SPECTATOR", local_port, host_ip, host_port)
-        app.run()
+        # Spectator mode via discovery only
+        result = discover_games()
+        if result:
+            host_ip, host_port = result
+            local_port = 5558  # Default spectator local port
+            print(f"\n[Spectate] Connecting to {host_ip}:{host_port}...")
+            app.setup("SPECTATOR", local_port, host_ip, host_port)
+            app.run()
+        else:
+            print("No game selected.")
 
     else:
         print("Exiting...")

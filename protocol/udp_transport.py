@@ -19,7 +19,9 @@ class UDPTransport:
         self.socket.settimeout(0.01)
         
         self.running = True
-        print(f"[UDP] Socket bound to {self.host}:{self.port}")
+        print("\nmessage_type: UDP_BIND")
+        print(f"host: {self.host}")
+        print(f"port: {self.port}")
 
     def send(self, data: bytes, addr: Tuple[str, int]):
         try:

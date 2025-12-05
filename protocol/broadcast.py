@@ -5,6 +5,7 @@ UDP broadcast-based game discovery for PokeProtocol.
 """
 
 import socket
+import time
 from typing import Optional, Tuple, List
 from .message import encode_message, decode_message
 
@@ -18,9 +19,16 @@ class BroadcastDiscovery:
         """
         self.port = port
         self.socket: Optional[socket.socket] = None
+        self.listen_only = False  
 
-    def open(self) -> None:
-        """Open and configure the broadcast socket."""
+    def open(self, listen_only: bool = False) -> None:
+        """Open and configure the broadcast socket.
+        
+        Args:
+            listen_only: If True, bind for receiving (JOINER discovery mode).
+                        If False, only set up for sending (HOST mode).
+        """
+        self.listen_only = listen_only
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         # Allow reuse on all platforms
@@ -35,14 +43,17 @@ class BroadcastDiscovery:
         # Enable broadcast sending
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-        # Bind ONCE here. No rebinding in listen_for_games().
-        try:
-            self.socket.bind(("", self.port))
-        except OSError as e:
-            print(f"[Broadcast] Warning: bind failed on port {self.port}: {e}")
+        # Only bind if we're listening for discoveries (JOINER mode)
+        if listen_only:
+            try:
+                self.socket.bind(("", self.port))
+                print(f"message_type: BROADCAST_INIT\nmode: listen\nport: {self.port}")
+            except OSError as e:
+                print(f"message_type: BROADCAST_ERROR\nerror: bind failed on port {self.port}: {e}")
+        else:
+            print(f"message_type: BROADCAST_INIT\nmode: send_only\nport: {self.port}")
 
         self.socket.settimeout(0.1)
-        print(f"[Broadcast] Socket ready on port {self.port}")
 
     def announce_game(self, host_name: str, game_port: int) -> bool:
         """Broadcast a GAME_ANNOUNCEMENT packet."""
@@ -68,14 +79,19 @@ class BroadcastDiscovery:
         if not self.socket:
             print("[Broadcast] Socket not initialized")
             return []
+        
+        # Only listen if opened in listen_only mode
+        if not self.listen_only:
+            print("[Broadcast] Socket not in listen mode. Skipping listen_for_games().")
+            return []
 
         print(f"[Broadcast] Listening for games for {timeout}s...")
 
         games = []
-        elapsed = 0.0
+        start_time = time.time()
         self.socket.settimeout(0.1)
 
-        while elapsed < timeout:
+        while time.time() - start_time < timeout:
             try:
                 data, addr = self.socket.recvfrom(4096)
                 msg = decode_message(data)
@@ -85,6 +101,7 @@ class BroadcastDiscovery:
                     game_port = int(msg.get("game_port", 0))
                     ip = addr[0]
 
+                    # Only add if we haven't seen this exact game before
                     if not any(g[1] == ip and g[2] == game_port for g in games):
                         games.append((host_name, ip, game_port))
                         print(f"[Broadcast] Found game: {host_name} @ {ip}:{game_port}")
@@ -93,8 +110,6 @@ class BroadcastDiscovery:
                 pass
             except Exception as e:
                 print(f"[Broadcast] Error receiving: {e}")
-
-            elapsed += 0.1
 
         return games
 
