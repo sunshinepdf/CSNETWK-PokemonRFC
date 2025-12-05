@@ -19,7 +19,7 @@ It only ensures messages eventually arrive or the connection fails.
 """
 
 import time
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 
 try:
     from .message import encode_message
@@ -38,8 +38,8 @@ class ReliabilityLayer:
         self.max_retries = max_retries
 
         self._seq = 0  # local sequence counter
-        # pending: seq_number -> (msg_bytes, addr, last_sent_time, retries)
-        self.pending: Dict[int, Tuple[bytes, Tuple[str, int], float, int]] = {}
+        # pending: (seq_number, addr) -> (msg_bytes, addr, last_sent_time, retries)
+        self.pending: Dict[Tuple[int, Tuple[str, int]], Tuple[bytes, Tuple[str, int], float, int]] = {}
 
     # ------------------------------
     #  Sequence number management
@@ -66,19 +66,52 @@ class ReliabilityLayer:
         now = time.time()
 
         # Track for future retransmission
-        self.pending[seq] = (msg_bytes, addr, now, 0)
+        self.pending[(seq, addr)] = (msg_bytes, addr, now, 0)
         return ok, seq
+
+    def send_reliable_to_many(self, transport, fields: Dict[str, Any], addrs: List[Tuple[str, int]]):
+        """
+        Assign a single sequence number and send the same encoded message to multiple addresses.
+        Tracks retransmissions per destination while preserving the same sequence_number.
+        Returns (aggregate_ok, seq).
+        """
+        seq = self.next_sequence_number()
+        fields["sequence_number"] = seq
+        msg_bytes = encode_message(fields)
+        now = time.time()
+        aggregate_ok = True
+        for addr in addrs:
+            ok = transport.send(msg_bytes, addr)
+            if not ok:
+                aggregate_ok = False
+            self.pending[(seq, addr)] = (msg_bytes, addr, now, 0)
+        return aggregate_ok, seq
+
+    def track_and_send_existing(self, transport, msg_bytes: bytes, seq: int, addrs: List[Tuple[str, int]]):
+        """
+        Send existing encoded message bytes (with an already-assigned sequence_number)
+        to multiple addresses and track retransmissions per destination.
+        """
+        now = time.time()
+        aggregate_ok = True
+        for addr in addrs:
+            ok = transport.send(msg_bytes, addr)
+            if not ok:
+                aggregate_ok = False
+            self.pending[(seq, addr)] = (msg_bytes, addr, now, 0)
+        return aggregate_ok
 
     # ------------------------------
     #  ACK Handling
     # ------------------------------
 
-    def handle_ack(self, ack_number: int):
+    def handle_ack(self, ack_number: int, addr: Tuple[str, int]):
         """
-        Remove acknowledged messages from pending queue.
+        Remove acknowledged messages for the given source from pending queue.
         """
-        if ack_number in self.pending:
-            del self.pending[ack_number]
+        key = (ack_number, addr)
+        if key in self.pending:
+            del self.pending[key]
 
     def maybe_send_ack(self, transport, seq: Optional[int], addr: Tuple[str, int]):
         """
@@ -109,6 +142,12 @@ class ReliabilityLayer:
             except ValueError:
                 # Ignore malformed
                 return
+            # Align local sequence to remote for a shared, monotonically
+            # increasing sequence space across both peers.
+            # This ensures the next locally sent message uses seq+1,
+            # making sender and receiver views consistent.
+            if seq_int > self._seq:
+                self._seq = seq_int
 
             self.maybe_send_ack(transport, seq_int, addr)
 
@@ -125,17 +164,17 @@ class ReliabilityLayer:
         now = time.time()
         to_delete = []
 
-        for seq, (msg_bytes, addr, last, retries) in self.pending.items():
+        for key, (msg_bytes, addr, last, retries) in list(self.pending.items()):
             if now - last > self.timeout:
                 if retries >= self.max_retries:
                     raise ReliabilityError(
-                        f"Message seq {seq} exceeded max retries ({self.max_retries}). "
+                        f"Message seq {key[0]} to {addr} exceeded max retries ({self.max_retries}). "
                         "Peer appears unresponsive."
                     )
 
                 # Retransmit
                 transport.send(msg_bytes, addr)
                 # Update tracking
-                self.pending[seq] = (msg_bytes, addr, now, retries + 1)
+                self.pending[key] = (msg_bytes, addr, now, retries + 1)
 
         # No deletion here; ACKs delete entries

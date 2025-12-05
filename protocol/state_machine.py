@@ -77,15 +77,14 @@ class ProtocolStateMachine:
     def _send_reliable(self, fields: Dict[str, Any]):
         if not self.peer_addr:
             return False, None
-        ok, seq = self.r.send_reliable(self.transport, fields, self.peer_addr)
-        # If we're HOST, also relay to all spectators so they receive events
+        # If HOST with spectators, send to peer and spectators with the same sequence_number
         if self.role == "HOST" and self.spectators:
-            for spec_addr in list(self.spectators):
-                try:
-                    self.r.send_reliable(self.transport, dict(fields), spec_addr)
-                except Exception:
-                    pass
-        return ok, seq
+            addrs = [self.peer_addr] + list(self.spectators)
+            ok, seq = self.r.send_reliable_to_many(self.transport, fields, addrs)
+            return ok, seq
+        else:
+            ok, seq = self.r.send_reliable(self.transport, fields, self.peer_addr)
+            return ok, seq
     
     def _print_message(self, fields: Dict[str, Any], seq: Optional[int] = None):
         """Print an outgoing message in RFC wire format with sequence_number if available."""
@@ -171,15 +170,29 @@ class ProtocolStateMachine:
         if self.role == "HOST" and self.peer_addr and addr == self.peer_addr:
             # Relay everything except ACKs to spectators so they see the same stream
             if message_type and message_type != "ACK":
-                forward_fields = dict(msg)
-                # strip reliability-only fields when forwarding
-                forward_fields.pop("sequence_number", None)
-                forward_fields.pop("ack_number", None)
-                for spec_addr in list(self.spectators):
-                    try:
-                        self.r.send_reliable(self.transport, dict(forward_fields), spec_addr)
-                    except Exception:
-                        pass
+                try:
+                    # Forward original message bytes with the same sequence_number
+                    from .message import encode_message
+                    msg_bytes = encode_message(msg)
+                    seq = msg.get("sequence_number")
+                    if isinstance(seq, int):
+                        seq_int = seq
+                    else:
+                        try:
+                            seq_int = int(seq) if seq is not None else None
+                        except Exception:
+                            seq_int = None
+                    if seq_int is not None:
+                        self.r.track_and_send_existing(self.transport, msg_bytes, seq_int, list(self.spectators))
+                    else:
+                        # If seq missing, just send (non-reliable)
+                        for spec_addr in list(self.spectators):
+                            try:
+                                self.transport.send(msg_bytes, spec_addr)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
         # Dispatch by message type
         if message_type == "HANDSHAKE_REQUEST":
@@ -218,30 +231,37 @@ class ProtocolStateMachine:
             # - If HOST receives from spectator (addr != peer_addr), forward to JOINER
             # - If HOST receives from JOINER (addr == peer_addr), forward to spectators
             if self.role == "HOST":
-                forward_fields = dict(msg)
-                # Remove reliability-only fields when forwarding
-                forward_fields.pop("sequence_number", None)
-                forward_fields.pop("ack_number", None)
-                if self.peer_addr and addr != self.peer_addr:
-                    # from spectator -> forward to joiner
-                    try:
-                        self.r.send_reliable(self.transport, forward_fields, self.peer_addr)
-                    except Exception:
-                        pass
-                else:
-                    # from joiner -> forward to all spectators
-                    for spec_addr in list(self.spectators):
-                        try:
-                            self.r.send_reliable(self.transport, dict(forward_fields), spec_addr)
-                        except Exception:
-                            pass
+                try:
+                    from .message import encode_message
+                    msg_bytes = encode_message(msg)
+                    seq = msg.get("sequence_number")
+                    # Relay preserving original sequence_number
+                    if self.peer_addr and addr != self.peer_addr:
+                        # from spectator -> forward to joiner
+                        if seq is not None:
+                            try:
+                                self.r.track_and_send_existing(self.transport, msg_bytes, int(seq), [self.peer_addr])
+                            except Exception:
+                                # Fallback: non-reliable send
+                                self.transport.send(msg_bytes, self.peer_addr)
+                    else:
+                        # from joiner -> forward to all spectators
+                        dests = list(self.spectators)
+                        if seq is not None and dests:
+                            try:
+                                self.r.track_and_send_existing(self.transport, msg_bytes, int(seq), dests)
+                            except Exception:
+                                for spec_addr in dests:
+                                    self.transport.send(msg_bytes, spec_addr)
+                except Exception:
+                    pass
 
         elif message_type == "ACK":
             # Handle ACK for reliability layer
             ack_num = msg.get("ack_number")
-            if ack_num:
+            if ack_num is not None:
                 try:
-                    self.r.handle_ack(int(ack_num))
+                    self.r.handle_ack(int(ack_num), addr)
                 except ValueError:
                     pass
 
@@ -302,6 +322,8 @@ class ProtocolStateMachine:
 
         self._print_incoming_header()
         print("message_type: HANDSHAKE_RESPONSE")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
         ok, missing = require_fields(msg, ["seed"])
         if not ok:
@@ -336,6 +358,23 @@ class ProtocolStateMachine:
         self._print_incoming_header()
         print("message_type: SPECTATOR_JOINED")
         print(f"address: {addr}")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
+
+        # Forward SPECTATOR_JOINED to JOINER with the same sequence_number so they see it too
+        if self.role == "HOST" and self.peer_addr:
+            try:
+                from .message import encode_message
+                msg_bytes = encode_message(msg)
+                seq = msg.get("sequence_number")
+                if seq is not None:
+                    try:
+                        self.r.track_and_send_existing(self.transport, msg_bytes, int(seq), [self.peer_addr])
+                    except Exception:
+                        # Fallback: non-reliable send
+                        self.transport.send(msg_bytes, self.peer_addr)
+            except Exception:
+                pass
 
     # ============================================================
     # ** BATTLE SETUP **
@@ -374,6 +413,8 @@ class ProtocolStateMachine:
             self.remote_name = rn
         self._print_incoming_header()
         print("message_type: BATTLE_SETUP")
+        if "sequence_number" in msg:
+            print(f"sequence_number: {msg['sequence_number']}")
 
         ok, missing = require_fields(
             msg,
@@ -415,14 +456,14 @@ class ProtocolStateMachine:
     # ** TURN 1: ATTACK ANNOUNCE **
     # ============================================================
 
-    def send_attack(self, move_name: str):
+    def send_attack(self, move_name: str) -> bool:
         """
         Called only when it is OUR turn.
         """
         if self.turn_owner != "LOCAL":
-            return
+            return False
         if self.state != "WAITING_FOR_MOVE":
-            return
+            return False
 
         # Save last announced move so attacker can use it later
         self.last_announced_move = move_name
@@ -435,6 +476,7 @@ class ProtocolStateMachine:
         self._print_message(fields, seq)
 
         self.state = "WAITING_FOR_DEFENSE"
+        return True
 
     def _on_attack_announce(self, msg):
         self._print_incoming_header()
@@ -753,7 +795,7 @@ class ProtocolStateMachine:
             text: Message text content
         """
         msg_dict = chat.make_text_message(sender_name, text)
-        ok, seq = self.r.send_reliable(self.transport, msg_dict, self.peer_addr)
+        ok, seq = self._send_reliable(msg_dict)
         
         # Print outgoing message in RFC format
         print(f"\n[{self.local_name}]")
@@ -773,7 +815,7 @@ class ProtocolStateMachine:
             sticker_bytes: Raw binary sticker data (e.g., PNG file bytes)
         """
         msg_dict = chat.make_sticker_message(sender_name, sticker_bytes)
-        ok, seq = self.r.send_reliable(self.transport, msg_dict, self.peer_addr)
+        ok, seq = self._send_reliable(msg_dict)
         
         # Print outgoing message in RFC format
         print(f"\n[{self.local_name}]")
