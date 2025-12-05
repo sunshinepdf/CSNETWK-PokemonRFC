@@ -95,6 +95,8 @@ class BattleApplication:
             )
             if not ok:
                 print("[App] Warning: initial HANDSHAKE_REQUEST may not have been sent")
+            else:
+                print("[App] HANDSHAKE_REQUEST sent successfully")
 
         # If spectating, send spectator request
         elif role == "SPECTATOR" and host_ip and host_port:
@@ -138,10 +140,9 @@ class BattleApplication:
                         self.state_machine.handle_incoming(incoming)
 
                     # Tick reliability layer and state machine
-                    # tick() lives in state_machine and will call reliability.tick
                     self.state_machine.tick()
 
-                    # Small delay to prevent CPU spinning (reduced for faster handshake)
+                    # Small delay to prevent CPU spinning
                     time.sleep(0.001)
                 except Exception as e:
                     # Log but keep loop alive if possible
@@ -278,7 +279,11 @@ class BattleApplication:
             print("[App] Error: State machine not initialized.")
             return
 
-        self.state_machine.send_attack(move_name)
+        success = self.state_machine.send_attack(move_name)
+        if success:
+            print(f"[App] Attacking with {move_name}...")
+        else:
+            print(f"[App] Failed to send attack. Check if it's your turn and both Pokémon are set up.")
 
     def _handle_chat(self, message: str):
         """Handle chat command."""
@@ -337,6 +342,8 @@ class BattleApplication:
         print(f"Role: {self.state_machine.role}")
         print(f"State: {self.state_machine.state}")
         print(f"Turn Owner: {self.state_machine.turn_owner}")
+        print(f"Peer Address: {self.state_machine.peer_addr}")
+        print(f"Running: {self.state_machine.running}")
 
         if self.state_machine.local_pokemon:
             p = self.state_machine.local_pokemon
@@ -367,6 +374,9 @@ class BattleApplication:
         if self.state_machine.role == "HOST" and self.broadcast:
             self._broadcast_thread = threading.Thread(target=self.announce_game_loop, daemon=True)
             self._broadcast_thread.start()
+
+        # Small delay to ensure network thread is running before input loop
+        time.sleep(0.1)
 
         # Run input loop in main thread
         try:
@@ -427,15 +437,23 @@ def discover_games():
 
     try:
         choice_raw = input("Enter game number to join (0 to cancel): ").strip()
+        if choice_raw == "":
+            print("[Discovery] No selection made.")
+            return None
         choice = int(choice_raw)
+        if choice == 0:
+            print("[Discovery] Cancelled.")
+            return None
         if 1 <= choice <= len(games):
             host_name, ip, port = games[choice - 1]
             print(f"[Discovery] Joining '{host_name}' at {ip}:{port}...")
             return ip, port  # Return (ip, port)
-    except (ValueError, IndexError, EOFError):
-        print("[Discovery] Invalid selection. Aborting join.")
-
-    return None
+        else:
+            print(f"[Discovery] Invalid choice. Must be between 1 and {len(games)}.")
+            return None
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        print("[Discovery] Invalid selection or cancelled.")
+        return None
 
 
 def main():
@@ -457,6 +475,10 @@ def main():
         return
 
     app = BattleApplication()
+
+    if choice == "0":
+        print("Exiting...")
+        return
 
     # Get player name
     try:
@@ -497,6 +519,9 @@ def main():
         # Join mode with manual IP
         try:
             host_ip = input("Enter host IP address: ").strip()
+            if not host_ip:
+                print("No IP address provided.")
+                return
             host_port = int(input("Enter host port: ").strip())
             local_port = int(input("Enter your local port (default 5557): ") or "5557")
         except (ValueError, EOFError, KeyboardInterrupt):
@@ -525,7 +550,7 @@ def main():
             print("No game selected.")
 
     else:
-        print("Exiting...")
+        print("Invalid choice. Exiting...")
 
 
 if __name__ == "__main__":
